@@ -1,3 +1,7 @@
+# Copyright FuseSoC contributors
+# Licensed under the 2-Clause BSD License, see LICENSE for details.
+# SPDX-License-Identifier: BSD-2-Clause
+
 # FIXME: Add IP-XACT support
 import logging
 import os
@@ -18,12 +22,14 @@ class File:
         self.copyto = ""
         self.file_type = ""
         self.is_include_file = False
+        self.include_path = None
         self.logical_name = ""
         if type(tree) is dict:
             for k, v in tree.items():
                 self.name = String(os.path.expandvars(k))
                 self.file_type = v.get("file_type", "")
                 self.is_include_file = v.get("is_include_file", False)
+                self.include_path = v.get("include_path")
                 self.copyto = v.get("copyto", "")
                 self.logical_name = v.get("logical_name", "")
         else:
@@ -199,7 +205,7 @@ class Core:
         if os.path.exists(dst_dir):
             shutil.rmtree(dst_dir)
 
-        src_files = [f.name for f in self.get_files(flags)]
+        src_files = [f["name"] for f in self.get_files(flags)]
 
         for k, v in self._get_vpi(flags).items():
             src_files += [
@@ -331,16 +337,11 @@ class Core:
         for f in src_files:
             pf = f.name.parse(flags)
             if pf:
-                _f = File(
-                    {
-                        pf: {
-                            "copyto": f.copyto,
-                            "file_type": f.file_type,
-                            "is_include_file": f.is_include_file,
-                            "logical_name": f.logical_name,
-                        }
-                    }
-                )
+                _f = {}
+                for k, v in vars(f).items():
+                    if v:
+                        _f[k] = v
+                _f["name"] = pf
                 _src_files.append(_f)
         return _src_files
 
@@ -353,7 +354,58 @@ class Core:
             self._debug(" Found generator " + k)
         return generators
 
-    def get_parameters(self, flags={}):
+    def get_parameters(self, flags={}, ext_parameters={}):
+        def _parse_param_value(name, datatype, default):
+            if datatype == "bool":
+                if default.lower() == "true":
+                    return True
+                elif default.lower() == "false":
+                    return False
+                else:
+                    _s = "{}: Invalid default value '{}' for bool parameter {}"
+                    raise SyntaxError(_s.format(self.name, default, p))
+            elif datatype == "int":
+                if type(default) == int:
+                    return default
+                else:
+                    return int(default, 0)
+            else:
+                return str(default)
+
+        def _parse_param(flags, name, core_param):
+            parsed_param = {}
+            datatype = core_param.datatype
+            description = core_param.description
+            paramtype = core_param.paramtype.parse(flags)
+
+            if not datatype in ["bool", "file", "int", "str"]:
+                _s = "{} : Invalid datatype '{}' for parameter {}"
+                raise SyntaxError(_s.format(self.name, datatype, p))
+
+            if not paramtype in [
+                "cmdlinearg",
+                "generic",
+                "plusarg",
+                "vlogdefine",
+                "vlogparam",
+            ]:
+                _s = "{} : Invalid paramtype '{}' for parameter {}"
+                raise SyntaxError(_s.format(self.name, paramtype, p))
+            parsed_param = {
+                "datatype": str(core_param.datatype),
+                "paramtype": paramtype,
+            }
+
+            if description:
+                parsed_param["description"] = str(description)
+
+            if core_param.default:
+                parsed_param["default"] = _parse_param_value(
+                    name, datatype, core_param.default
+                )
+
+            return parsed_param
+
         self._debug("Getting parameters for flags '{}'".format(str(flags)))
         target = self._get_target(flags)
         parameters = {}
@@ -364,62 +416,34 @@ class Core:
 
                 p = plist[0]
 
+                # parse might have left us with an empty string for the parameter name
+                # In that case, just go to the next parameter
                 if not p:
                     continue
 
-                if not p in self.parameters:
+                # The parameter exists either in this core...
+                if p in self.parameters:
+                    parameters[p] = _parse_param(flags, p, self.parameters[p])
+
+                # ...or in any of its dependencies
+                elif p in ext_parameters:
+                    parameters[p] = ext_parameters[p]
+                    datatype = parameters[p]["datatype"]
+
+                else:
                     raise SyntaxError(
                         "Parameter '{}', requested by target '{}', was not found".format(
                             p, target.name
                         )
                     )
 
-                datatype = self.parameters[p].datatype
+                # Set default value
                 if len(plist) > 1:
-                    default = plist[1]
-                else:
-                    default = self.parameters[p].default
-                description = self.parameters[p].description
-                paramtype = self.parameters[p].paramtype.parse(flags)
+                    parameters[p]["default"] = _parse_param_value(
+                        p, parameters[p]["datatype"], plist[1]
+                    )
 
-                if not datatype in ["bool", "file", "int", "str"]:
-                    _s = "{} : Invalid datatype '{}' for parameter {}"
-                    raise SyntaxError(_s.format(self.name, datatype, p))
-
-                if not paramtype in [
-                    "cmdlinearg",
-                    "generic",
-                    "plusarg",
-                    "vlogdefine",
-                    "vlogparam",
-                ]:
-                    _s = "{} : Invalid paramtype '{}' for parameter {}"
-                    raise SyntaxError(_s.format(self.name, paramtype, p))
-                parameters[p] = {
-                    "datatype": str(self.parameters[p].datatype),
-                    "paramtype": paramtype,
-                }
-
-                if description:
-                    parameters[p]["description"] = str(description)
-
-                if default:
-                    if datatype == "bool":
-                        if default.lower() == "true":
-                            parameters[p]["default"] = True
-                        elif default.lower() == "false":
-                            parameters[p]["default"] = False
-                        else:
-                            _s = "{}: Invalid default value '{}' for bool parameter {}"
-                            raise SyntaxError(_s.format(self.name, default, p))
-                    elif datatype == "int":
-                        if type(default) == int:
-                            parameters[p]["default"] = default
-                        else:
-                            parameters[p]["default"] = int(default, 0)
-                    else:
-                        parameters[p]["default"] = str(default)
-        self._debug("Found parameters {}".format(parameters))
+            self._debug("Found parameters {}".format(parameters))
         return parameters
 
     def get_toplevel(self, flags):
@@ -908,6 +932,7 @@ A File object represents a physical file. It can be a simple string, with the pa
 Attribute       Type Description
 =============== ==== ===========
 is_include_file bool Treats file as an include file when true
+include_path    str  Explicitly set an include directory, relative to core root, instead of the directory containing the file
 file_type       str  File type. Overrides the file_type set on the containing fileset
 logical_name    str  Logical name, i.e. library for VHDL/SystemVerilog. Overrides the logical_name set on the containing fileset
 =============== ==== ===========
